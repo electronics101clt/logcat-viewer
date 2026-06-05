@@ -12,10 +12,9 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
-import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import kotlinx.coroutines.*
-import java.io.BufferedReader
 
 class MainActivity : AppCompatActivity() {
 
@@ -25,15 +24,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var adapter: AppLogAdapter
 
     private val appLogs = mutableMapOf<String, MutableList<LogEntry>>()
+    private var displayList = mutableListOf<Pair<String, MutableList<LogEntry>>>()
     private val scope = CoroutineScope(Dispatchers.Main + Job())
     private var logcatProcess: Process? = null
+    private var currentFilter = ""
 
     data class LogEntry(
         val timestamp: String,
         val level: String,
         val tag: String,
         val message: String,
-        val raw: String
+        val raw: String,
+        val time: Long = System.currentTimeMillis()
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -44,17 +46,16 @@ class MainActivity : AppCompatActivity() {
         searchEdit = findViewById(R.id.searchEdit)
         statusText = findViewById(R.id.statusText)
 
-        adapter = AppLogAdapter(appLogs) { pkg, logs ->
-            showAppLogs(pkg, logs)
-        }
-        recyclerView.layoutManager = LinearLayoutManager(this)
+        adapter = AppLogAdapter()
+        recyclerView.layoutManager = GridLayoutManager(this, 3)
         recyclerView.adapter = adapter
 
         searchEdit.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
             override fun afterTextChanged(s: Editable?) {
-                adapter.filter(s?.toString() ?: "")
+                currentFilter = s?.toString() ?: ""
+                updateDisplayList()
             }
         })
 
@@ -63,6 +64,26 @@ class MainActivity : AppCompatActivity() {
         } else {
             startLogcat()
         }
+    }
+
+    private fun updateDisplayList() {
+        displayList.clear()
+        val query = currentFilter.lowercase()
+
+        synchronized(appLogs) {
+            if (query.isEmpty()) {
+                displayList.addAll(appLogs.map { it.key to it.value })
+            } else {
+                displayList.addAll(appLogs.filter { (pkg, logs) ->
+                    pkg.lowercase().contains(query) ||
+                    logs.any { it.raw.lowercase().contains(query) }
+                }.map { it.key to it.value })
+            }
+        }
+
+        // Sort by most recent activity
+        displayList.sortByDescending { it.second.lastOrNull()?.time ?: 0 }
+        adapter.notifyDataSetChanged()
     }
 
     private fun checkLogPermission(): Boolean {
@@ -96,32 +117,39 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startLogcat() {
-        statusText.text = "Reading logcat..."
+        statusText.text = "Starting fresh..."
 
         scope.launch(Dispatchers.IO) {
             try {
-                // Clear old logs first
+                // Clear old logs - start fresh
                 Runtime.getRuntime().exec("logcat -c").waitFor()
 
+                // Start reading live logs only
                 logcatProcess = Runtime.getRuntime().exec("logcat -v threadtime")
                 val reader = logcatProcess!!.inputStream.bufferedReader()
 
                 var lineCount = 0
+                var lastUpdate = System.currentTimeMillis()
+
                 reader.forEachLine { line ->
                     parseLogLine(line)?.let { entry ->
                         synchronized(appLogs) {
                             val pkg = extractPackage(entry.tag)
                             appLogs.getOrPut(pkg) { mutableListOf() }.add(entry)
-                            // Keep only last 100 entries per app
-                            if (appLogs[pkg]!!.size > 100) {
+                            // Keep only last 50 entries per app
+                            if (appLogs[pkg]!!.size > 50) {
                                 appLogs[pkg]!!.removeAt(0)
                             }
                         }
                         lineCount++
-                        if (lineCount % 10 == 0) {
+
+                        // Update UI frequently
+                        val now = System.currentTimeMillis()
+                        if (now - lastUpdate > 200) {
+                            lastUpdate = now
                             launch(Dispatchers.Main) {
-                                statusText.text = "Apps: ${appLogs.size} | Lines: $lineCount"
-                                adapter.notifyDataSetChanged()
+                                statusText.text = "Live | ${appLogs.size} apps | $lineCount logs"
+                                updateDisplayList()
                             }
                         }
                     }
@@ -135,7 +163,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun parseLogLine(line: String): LogEntry? {
-        // Format: 06-04 23:24:24.056 pid tid level tag: message
         val regex = """^(\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)\s+\d+\s+\d+\s+([VDIWEF])\s+([^:]+):\s*(.*)$""".toRegex()
         val match = regex.find(line) ?: return null
 
@@ -149,18 +176,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun extractPackage(tag: String): String {
-        // Common patterns to identify apps
         return when {
-            tag.contains("ActivityManager") -> "System: Activity"
-            tag.contains("WindowManager") -> "System: Window"
-            tag.contains("AudioFlinger") -> "System: Audio"
-            tag.contains("MediaPlayer") -> "Media: Player"
-            tag.contains("MediaSession") -> "Media: Session"
-            tag.contains("Wifi") || tag.contains("wifi") -> "System: WiFi"
-            tag.contains("Bluetooth") || tag.contains("bt_") -> "System: Bluetooth"
-            tag.contains("Power") || tag.contains("Battery") -> "System: Power"
-            tag.startsWith("com.") -> tag.substringBefore("/").substringBeforeLast(".")
-            else -> tag.take(20)
+            tag.contains("ActivityManager") -> "Activity"
+            tag.contains("WindowManager") -> "Window"
+            tag.contains("AudioFlinger") || tag.contains("AudioOut") || tag.contains("AudioALSA") -> "Audio"
+            tag.contains("MediaPlayer") || tag.contains("MediaSession") || tag.contains("NuPlayer") -> "Media"
+            tag.contains("Wifi") || tag.contains("wifi") || tag.contains("WifiNetworkSelector") -> "WiFi"
+            tag.contains("Bluetooth") || tag.contains("bt_") -> "Bluetooth"
+            tag.contains("Power") || tag.contains("Battery") -> "Power"
+            tag.contains("radiogarden") -> "Radio Garden"
+            tag.contains("StatusBar") -> "StatusBar"
+            tag.contains("BufferQueue") -> "Graphics"
+            tag.contains("chatty") -> "System"
+            tag.contains("vendor.mediatek") -> "MTK"
+            tag.startsWith("com.") -> {
+                val parts = tag.substringBefore("/").split(".")
+                if (parts.size >= 3) parts.takeLast(2).joinToString(".") else tag.take(15)
+            }
+            else -> tag.take(12)
         }
     }
 
@@ -169,9 +202,9 @@ class MainActivity : AppCompatActivity() {
         val listView = view.findViewById<ListView>(R.id.logListView)
         val searchLog = view.findViewById<EditText>(R.id.searchLogEdit)
 
-        val allLogs = logs.toMutableList()
-        val logAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1,
-            allLogs.map { "${it.timestamp} [${it.level}] ${it.message}".take(100) })
+        var filteredLogs = logs.sortedByDescending { it.time }.toMutableList()
+        val displayLogs = filteredLogs.map { "[${it.level}] ${it.message}".take(80) }.toMutableList()
+        val logAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, displayLogs)
         listView.adapter = logAdapter
 
         searchLog.addTextChangedListener(object : TextWatcher {
@@ -179,29 +212,31 @@ class MainActivity : AppCompatActivity() {
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
             override fun afterTextChanged(s: Editable?) {
                 val query = s?.toString()?.lowercase() ?: ""
-                val filtered = if (query.isEmpty()) allLogs
-                    else allLogs.filter { it.raw.lowercase().contains(query) }
+                filteredLogs = if (query.isEmpty()) logs.sortedByDescending { it.time }.toMutableList()
+                    else logs.filter { it.raw.lowercase().contains(query) }.sortedByDescending { it.time }.toMutableList()
                 logAdapter.clear()
-                logAdapter.addAll(filtered.map { "${it.timestamp} [${it.level}] ${it.message}".take(100) })
+                logAdapter.addAll(filteredLogs.map { "[${it.level}] ${it.message}".take(80) })
             }
         })
 
         listView.setOnItemClickListener { _, _, position, _ ->
-            val entry = allLogs[position]
-            AlertDialog.Builder(this)
-                .setTitle("${entry.level}: ${entry.tag}")
-                .setMessage("${entry.timestamp}\n\n${entry.message}")
-                .setPositiveButton("Copy") { _, _ ->
-                    val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    clipboard.setPrimaryClip(ClipData.newPlainText("Log", entry.raw))
-                    Toast.makeText(this, "Copied!", Toast.LENGTH_SHORT).show()
-                }
-                .setNegativeButton("Close", null)
-                .show()
+            if (position < filteredLogs.size) {
+                val entry = filteredLogs[position]
+                AlertDialog.Builder(this)
+                    .setTitle("${entry.level}: ${entry.tag}")
+                    .setMessage("${entry.timestamp}\n\n${entry.message}")
+                    .setPositiveButton("Copy") { _, _ ->
+                        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Log", entry.raw))
+                        Toast.makeText(this, "Copied!", Toast.LENGTH_SHORT).show()
+                    }
+                    .setNegativeButton("Close", null)
+                    .show()
+            }
         }
 
         AlertDialog.Builder(this)
-            .setTitle(pkg)
+            .setTitle("$pkg (${logs.size} logs)")
             .setView(view)
             .setPositiveButton("Close", null)
             .show()
@@ -213,12 +248,7 @@ class MainActivity : AppCompatActivity() {
         logcatProcess?.destroy()
     }
 
-    inner class AppLogAdapter(
-        private val data: MutableMap<String, MutableList<LogEntry>>,
-        private val onClick: (String, List<LogEntry>) -> Unit
-    ) : RecyclerView.Adapter<AppLogAdapter.ViewHolder>() {
-
-        private var filteredKeys = data.keys.toList()
+    inner class AppLogAdapter : RecyclerView.Adapter<AppLogAdapter.ViewHolder>() {
 
         inner class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
             val appName: TextView = view.findViewById(R.id.appName)
@@ -233,30 +263,18 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun onBindViewHolder(holder: ViewHolder, position: Int) {
-            val pkg = filteredKeys[position]
-            val logs = data[pkg] ?: emptyList()
+            val (pkg, logs) = displayList[position]
+            val last = logs.lastOrNull()
 
             holder.appName.text = pkg
-            holder.logCount.text = "${logs.size} logs"
-            holder.lastLog.text = logs.lastOrNull()?.message?.take(50) ?: ""
+            holder.logCount.text = "${logs.size}"
+            holder.lastLog.text = last?.message?.take(40) ?: ""
 
             holder.itemView.setOnClickListener {
-                onClick(pkg, logs)
+                showAppLogs(pkg, logs.toList())
             }
         }
 
-        override fun getItemCount() = filteredKeys.size
-
-        fun filter(query: String) {
-            filteredKeys = if (query.isEmpty()) {
-                data.keys.toList()
-            } else {
-                data.keys.filter { pkg ->
-                    pkg.lowercase().contains(query.lowercase()) ||
-                    data[pkg]?.any { it.raw.lowercase().contains(query.lowercase()) } == true
-                }
-            }
-            notifyDataSetChanged()
-        }
+        override fun getItemCount() = displayList.size
     }
 }
