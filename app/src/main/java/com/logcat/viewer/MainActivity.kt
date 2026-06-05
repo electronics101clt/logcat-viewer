@@ -21,6 +21,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var recyclerView: RecyclerView
     private lateinit var searchEdit: EditText
     private lateinit var statusText: TextView
+    private lateinit var progressBar: ProgressBar
+    private lateinit var pauseButton: Button
     private lateinit var adapter: AppLogAdapter
 
     private val appLogs = mutableMapOf<String, MutableList<LogEntry>>()
@@ -28,6 +30,7 @@ class MainActivity : AppCompatActivity() {
     private val scope = CoroutineScope(Dispatchers.Main + Job())
     private var logcatProcess: Process? = null
     private var currentFilter = ""
+    private var isPaused = false
 
     data class LogEntry(
         val timestamp: String,
@@ -45,10 +48,17 @@ class MainActivity : AppCompatActivity() {
         recyclerView = findViewById(R.id.recyclerView)
         searchEdit = findViewById(R.id.searchEdit)
         statusText = findViewById(R.id.statusText)
+        progressBar = findViewById(R.id.progressBar)
+        pauseButton = findViewById(R.id.pauseButton)
 
         adapter = AppLogAdapter()
         recyclerView.layoutManager = GridLayoutManager(this, 3)
         recyclerView.adapter = adapter
+
+        pauseButton.setOnClickListener {
+            isPaused = !isPaused
+            pauseButton.text = if (isPaused) "▶" else "⏸"
+        }
 
         searchEdit.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
@@ -117,43 +127,61 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startLogcat() {
-        statusText.text = "Starting fresh..."
+        statusText.text = "Counting..."
+        progressBar.progress = 0
 
         scope.launch(Dispatchers.IO) {
             try {
-                // Clear old logs - start fresh
-                Runtime.getRuntime().exec("logcat -c").waitFor()
+                // First count total logs in buffer
+                val countProcess = Runtime.getRuntime().exec("logcat -d")
+                val countReader = countProcess.inputStream.bufferedReader()
+                val allLines = countReader.readLines()
+                countProcess.waitFor()
+                val totalLogs = allLines.size
 
-                // Start reading live logs only
-                logcatProcess = Runtime.getRuntime().exec("logcat -v threadtime")
-                val reader = logcatProcess!!.inputStream.bufferedReader()
+                launch(Dispatchers.Main) {
+                    statusText.text = "0 / $totalLogs"
+                    progressBar.max = totalLogs.coerceAtLeast(1)
+                }
 
+                // Now process the logs we already have
                 var lineCount = 0
                 var lastUpdate = System.currentTimeMillis()
 
-                reader.forEachLine { line ->
-                    parseLogLine(line)?.let { entry ->
-                        synchronized(appLogs) {
-                            val pkg = extractPackage(entry.tag)
-                            appLogs.getOrPut(pkg) { mutableListOf() }.add(entry)
-                            // Keep only last 50 entries per app
-                            if (appLogs[pkg]!!.size > 50) {
-                                appLogs[pkg]!!.removeAt(0)
+                for (line in allLines) {
+                    if (!isPaused) {
+                        parseLogLine(line)?.let { entry ->
+                            synchronized(appLogs) {
+                                val pkg = extractPackage(entry.tag)
+                                appLogs.getOrPut(pkg) { mutableListOf() }.add(entry)
+                                if (appLogs[pkg]!!.size > 50) {
+                                    appLogs[pkg]!!.removeAt(0)
+                                }
                             }
-                        }
-                        lineCount++
+                            lineCount++
 
-                        // Update UI frequently
-                        val now = System.currentTimeMillis()
-                        if (now - lastUpdate > 200) {
-                            lastUpdate = now
-                            launch(Dispatchers.Main) {
-                                statusText.text = "Live | ${appLogs.size} apps | $lineCount logs"
-                                updateDisplayList()
+                            val now = System.currentTimeMillis()
+                            if (now - lastUpdate > 50) {
+                                lastUpdate = now
+                                launch(Dispatchers.Main) {
+                                    progressBar.progress = lineCount
+                                    val pct = (lineCount * 100) / totalLogs.coerceAtLeast(1)
+                                    statusText.text = "$pct% | ${appLogs.size} apps"
+                                    updateDisplayList()
+                                }
                             }
                         }
                     }
                 }
+
+                // Done processing - show complete
+                launch(Dispatchers.Main) {
+                    progressBar.progress = totalLogs
+                    statusText.text = "${appLogs.size} apps | $lineCount logs"
+                    updateDisplayList()
+                    pauseButton.text = "✓"
+                }
+
             } catch (e: Exception) {
                 launch(Dispatchers.Main) {
                     statusText.text = "Error: ${e.message}"
